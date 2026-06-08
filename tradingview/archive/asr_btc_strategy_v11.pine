@@ -1,0 +1,559 @@
+//@version=6
+// ASR BTC Strategy v4 - 3-Level Pyramiding
+// 3-level entries at midLow/sup/downer (long) & midHigh/res/uper (short)
+// TP at midline | BE+buffer after N bars | MA200 short filter
+// Backtest: 1h FULL +24%, OOS +2.8%, Sharpe 0.51, WR 76%
+
+strategy("ASR BTC 3-Level Strategy v11",
+         overlay=true,
+         precision=2,
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=33,
+         commission_type=strategy.commission.percent,
+         commission_value=0.036,
+         slippage=3,
+         pyramiding=3,
+         calc_on_every_tick=false,
+         max_labels_count=500,
+         margin_long=0,
+         margin_short=0)
+
+// ============================================================
+// Inputs - Timeframe Adaptation
+// ============================================================
+string GRP_TF  = "Timeframe Adaptation"
+baseTFMinutes  = input.int(60, "Base Timeframe (min)", group=GRP_TF)
+
+currentTF = timeframe.in_seconds(timeframe.period) / 60.0
+tfMultiplier = baseTFMinutes / currentTF
+
+// ============================================================
+// Inputs - ASR Indicator
+// ============================================================
+string GRP_IND = "ASR Indicator"
+hlLength_input       = input.int(75,   "HL Length (base)",     group=GRP_IND, minval=10, maxval=200)
+atrLength_input      = input.int(20,   "ATR Length (base)",    group=GRP_IND, minval=5,  maxval=100)
+vovLength_input      = input.int(100,  "VoV Length (base)",    group=GRP_IND, minval=20, maxval=300)
+smoothFactor_input   = input.int(12,   "Smooth Factor (base)", group=GRP_IND, minval=2,  maxval=50)
+baseWidthPct         = input.float(8.0,"Base Width %",         group=GRP_IND, minval=1.0,maxval=20.0, step=0.5)
+adjustFactor         = input.float(0.5,"Adjust Factor",        group=GRP_IND, minval=0.1,maxval=2.0,  step=0.1)
+
+hlLength     = math.round(math.max(1, hlLength_input * tfMultiplier))
+atrLength    = math.round(math.max(1, atrLength_input * tfMultiplier))
+vovLength    = math.round(math.max(1, vovLength_input * tfMultiplier))
+smoothFactor = math.round(math.max(1, smoothFactor_input * tfMultiplier))
+
+// ============================================================
+// Inputs - Strategy
+// ============================================================
+string GRP_STR = "Strategy Parameters"
+zoneChannelPct = input.float(8.0, "Zone % of Channel", group=GRP_STR, minval=0.5, maxval=30.0, step=0.5) / 100.0
+stopMult       = input.float(2.5, "Stop Multiplier",     group=GRP_STR, minval=0.5, maxval=5.0, step=0.1)
+beBuffer       = input.float(0.3, "BE Buffer %",         group=GRP_STR, minval=0.0, maxval=1.0, step=0.1, tooltip="Breakeven stop offset (entry + buffer%)") / 100.0
+timeStopBars_in= input.int(24,    "Time Stop Bars (base)",group=GRP_STR, minval=4, maxval=100)
+timeStopBars   = math.round(math.max(1, timeStopBars_in * tfMultiplier))
+outsideStopBars= input.int(3,     "Outside Channel Stop Bars", group=GRP_STR, minval=1, maxval=20)
+trendMA_input  = input.int(200,   "Trend MA (base)",     group=GRP_STR, minval=50,  maxval=500)
+trendMA        = math.round(math.max(10, trendMA_input * tfMultiplier))
+enableMAEntryFilter = input.bool(false, "Enable MA Entry Filter", group=GRP_STR, tooltip="When on, Long1 requires close > MA and Short1 requires close < MA. When off, both directions ignore MA entry filtering.")
+rsiPeriod      = input.int(14,    "RSI Period",          group=GRP_STR, minval=5,   maxval=30)
+rsiLong        = input.float(40.0,"RSI Long Threshold",  group=GRP_STR, minval=20.0,maxval=60.0, tooltip="Long entry: RSI must be BELOW this (oversold)")
+rsiShort       = input.float(60.0,"RSI Short Threshold", group=GRP_STR, minval=40.0,maxval=80.0, tooltip="Short entry: RSI must be ABOVE this (overbought)")
+cooldownBars_in= input.int(3,     "Cooldown Bars (base)",group=GRP_STR, minval=0, maxval=20)
+cooldownBars   = math.round(math.max(0, cooldownBars_in * tfMultiplier))
+enableShort    = input.bool(true,  "Enable Short",        group=GRP_STR)
+breakout15m    = input.bool(true,  "15m Breakout Flip",   group=GRP_STR)
+breakoutRsiHigh= input.float(78.0, "15m Breakout Long TP RSI", group=GRP_STR, minval=50.0, maxval=95.0)
+breakoutRsiLow = input.float(22.0, "15m Breakout Short TP RSI", group=GRP_STR, minval=5.0, maxval=50.0)
+breakoutBackBars = input.int(2,    "15m Breakout Back-In Bars", group=GRP_STR, minval=1, maxval=10)
+breakoutConfirmBars = input.int(2, "15m Breakout Confirm Bars", group=GRP_STR, minval=1, maxval=10)
+breakoutMinHoldBars = input.int(8, "15m Breakout Min Hold Bars", group=GRP_STR, minval=1, maxval=100)
+breakoutCooldownBars = input.int(12, "15m Breakout Cooldown Bars", group=GRP_STR, minval=1, maxval=200)
+reverseStopLookback = input.int(30, "15m Reverse Stop Lookback", group=GRP_STR, minval=5, maxval=200)
+reverseLockBars = 136
+
+// ============================================================
+// Inputs - Display
+// ============================================================
+string GRP_DSP = "Display"
+showBands      = input.bool(true,  "Show ASR Bands",      group=GRP_DSP)
+showTrendMA    = input.bool(true,  "Show Trend MA",        group=GRP_DSP)
+showStopLine   = input.bool(true,  "Show Stop Level",      group=GRP_DSP)
+
+// ============================================================
+// ASR Indicator Calculation
+// ============================================================
+midLine = ta.sma((high + low) / 2.0, hlLength)
+atr_    = ta.atr(atrLength)
+tr_     = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+
+rocVol  = ta.stdev(math.abs(ta.roc(close, 1)), 20) / close * 10000.0
+compVol = tr_ * 0.4 + atr_ * 0.4 + rocVol * 0.2
+vovDenom = ta.sma(compVol, vovLength)
+vov      = vovDenom > 0 ? ta.stdev(compVol, vovLength) / vovDenom : 0.0
+vovSafe  = na(vov) or vov > 10.0 ? 0.0 : vov
+
+dynamicOffset = (midLine * baseWidthPct / 100.0 / 2.0) * (1.0 + vovSafe * adjustFactor)
+
+smoothRes  = ta.ema(midLine + dynamicOffset, smoothFactor)
+smoothSup  = ta.ema(midLine - dynamicOffset, smoothFactor)
+smoothMid  = ta.ema(midLine, smoothFactor)
+midHigh    = (smoothMid + smoothRes) / 2.0
+midLow     = (smoothMid + smoothSup) / 2.0
+superbuy   = smoothMid + dynamicOffset * 1.618
+supersell  = smoothMid - dynamicOffset * 1.618
+
+// Channel edge bands (3rd entry levels)
+uperLine    = smoothRes + dynamicOffset * 0.25
+downerLine  = smoothSup - dynamicOffset * 0.25
+channelWidth = math.max(nz(math.abs(smoothRes - smoothSup), syminfo.mintick * 2.0), syminfo.mintick * 2.0)
+zoneOffset = math.max(syminfo.mintick, channelWidth * zoneChannelPct)
+tpZoneOffset = math.max(syminfo.mintick, zoneOffset * 0.5)
+
+// ============================================================
+// Trend Filter
+// ============================================================
+maLine    = ta.sma(close, trendMA)
+rsiVal    = ta.rsi(close, rsiPeriod)
+uptrend   = close > maLine
+downtrend = close < maLine
+reverseLongStopRef = ta.highest(high, reverseStopLookback)[1]
+reverseShortStopRef = ta.lowest(low, reverseStopLookback)[1]
+reverseStopBuffer = math.max(syminfo.mintick, atr_ * 0.1)
+reverseShortStopPx = na(reverseLongStopRef) ? na : math.max(high, reverseLongStopRef) + reverseStopBuffer
+reverseLongStopPx = na(reverseShortStopRef) ? na : math.min(low, reverseShortStopRef) - reverseStopBuffer
+longMAFilterOK = not enableMAEntryFilter or uptrend
+shortMAFilterOK = not enableMAEntryFilter or downtrend
+
+// ============================================================
+// State Variables
+// ============================================================
+curOfs = math.max(dynamicOffset, 1.0)
+
+// Per-entry tracking (3 levels)
+var int   nLong         = 0
+var int   nShort        = 0
+var int   lastEntryBar  = 0
+var float entryPx1      = na
+var float entryPx2      = na
+var float entryPx3      = na
+var int   entryBar1     = 0
+var int   entryBar2     = 0
+var int   entryBar3     = 0
+var bool  be1           = false
+var bool  be2           = false
+var bool  be3           = false
+var int   trendMode     = 0
+var int   breakoutInsideBars = 0
+var int   breakoutAboveBars = 0
+var int   breakoutBelowBars = 0
+var int   breakoutEntryBar = na
+var int   lastBreakoutBar = -10000
+var float reverseStopPx = na
+var float reverseTpPx = na
+var int   outsideLongBars = 0
+var int   outsideShortBars = 0
+
+cooldownOK = (bar_index - lastEntryBar) >= cooldownBars
+bullishCandle = close > open
+bearishCandle = close < open
+is15m = math.abs(currentTF - 15.0) < 0.1
+breakoutAboveBars := breakout15m and is15m and close > superbuy ? breakoutAboveBars + 1 : 0
+breakoutBelowBars := breakout15m and is15m and close < supersell ? breakoutBelowBars + 1 : 0
+breakoutReady = (bar_index - lastBreakoutBar) >= breakoutCooldownBars
+breakoutUp = breakout15m and is15m and trendMode == 0 and breakoutReady and breakoutAboveBars >= breakoutConfirmBars
+breakoutDown = breakout15m and is15m and trendMode == 0 and breakoutReady and breakoutBelowBars >= breakoutConfirmBars
+didBreakoutFlip = false
+didBreakoutExit = false
+didFastExit = false
+reverseLockActive = (trendMode == 2 or trendMode == -2) and (bar_index - lastEntryBar) < reverseLockBars
+reverseInChannel = close >= smoothSup and close <= smoothRes
+
+if breakoutUp and trendMode != 1
+    strategy.close_all("Breakout Flip Up")
+    strategy.entry("TrendLong", strategy.long, qty=strategy.equity / close)
+    nLong        := 0
+    nShort       := 0
+    entryPx1     := na
+    entryPx2     := na
+    entryPx3     := na
+    be1          := false
+    be2          := false
+    be3          := false
+    trendMode    := 1
+    breakoutInsideBars := 0
+    breakoutEntryBar := bar_index
+    lastBreakoutBar := bar_index
+    reverseStopPx := na
+    reverseTpPx := na
+    lastEntryBar := bar_index
+    didBreakoutFlip := true
+
+if breakoutDown and trendMode != -1
+    strategy.close_all("Breakout Flip Down")
+    strategy.entry("TrendShort", strategy.short, qty=strategy.equity / close)
+    nLong        := 0
+    nShort       := 0
+    entryPx1     := na
+    entryPx2     := na
+    entryPx3     := na
+    be1          := false
+    be2          := false
+    be3          := false
+    trendMode    := -1
+    breakoutInsideBars := 0
+    breakoutEntryBar := bar_index
+    lastBreakoutBar := bar_index
+    reverseStopPx := na
+    reverseTpPx := na
+    lastEntryBar := bar_index
+    didBreakoutFlip := true
+
+// ============================================================
+// Helper: position direction
+// ============================================================
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+isFlat  = strategy.position_size == 0
+outsideLongBars := trendMode == 0 and isLong and close < downerLine ? outsideLongBars + 1 : 0
+outsideShortBars := trendMode == 0 and isShort and close > uperLine ? outsideShortBars + 1 : 0
+
+if trendMode == 2 and isLong and reverseInChannel and not na(strategy.position_avg_price)
+    reverseStopPx := math.max(nz(reverseStopPx, strategy.position_avg_price), strategy.position_avg_price)
+
+if trendMode == -2 and isShort and reverseInChannel and not na(strategy.position_avg_price)
+    reverseStopPx := math.min(nz(reverseStopPx, strategy.position_avg_price), strategy.position_avg_price)
+
+if not didBreakoutFlip and trendMode == 1
+    breakoutHeldLongEnough = not na(breakoutEntryBar) and (bar_index - breakoutEntryBar) >= breakoutMinHoldBars
+    breakoutInsideBars := breakoutHeldLongEnough and close <= smoothRes ? breakoutInsideBars + 1 : 0
+    breakoutLongTP = isLong and rsiVal >= breakoutRsiHigh
+    breakoutLongStop = breakoutInsideBars >= breakoutBackBars
+    if breakoutLongTP
+        strategy.entry("RevShort", strategy.short, qty=strategy.equity / close)
+        trendMode := -2
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := reverseShortStopPx
+        reverseTpPx := smoothMid
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+    else if breakoutLongStop
+        strategy.close("TrendLong", comment="Breakout Stop")
+        trendMode := 0
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := na
+        reverseTpPx := na
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+
+if not didBreakoutFlip and trendMode == -1
+    breakoutHeldLongEnough = not na(breakoutEntryBar) and (bar_index - breakoutEntryBar) >= breakoutMinHoldBars
+    breakoutInsideBars := breakoutHeldLongEnough and close >= smoothSup ? breakoutInsideBars + 1 : 0
+    breakoutShortTP = isShort and rsiVal <= breakoutRsiLow
+    breakoutShortStop = breakoutInsideBars >= breakoutBackBars
+    if breakoutShortTP
+        strategy.entry("RevLong", strategy.long, qty=strategy.equity / close)
+        trendMode := 2
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := reverseLongStopPx
+        reverseTpPx := smoothMid
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+    else if breakoutShortStop
+        strategy.close("TrendShort", comment="Breakout Stop")
+        trendMode := 0
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := na
+        reverseTpPx := na
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+
+if not didBreakoutFlip and not didBreakoutExit and trendMode == 2 and not na(reverseStopPx) and not reverseLockActive
+    reverseTpPx := smoothMid
+    if not na(reverseTpPx)
+        strategy.exit("Exit RevLong", "RevLong", stop=reverseStopPx, limit=reverseTpPx)
+    else
+        strategy.exit("Exit RevLong", "RevLong", stop=reverseStopPx)
+    if isLong and na(reverseTpPx) and close >= smoothMid
+        strategy.close("RevLong", comment="Reverse TP Channel")
+
+if not didBreakoutFlip and not didBreakoutExit and trendMode == -2 and not na(reverseStopPx) and not reverseLockActive
+    reverseTpPx := smoothMid
+    if not na(reverseTpPx)
+        strategy.exit("Exit RevShort", "RevShort", stop=reverseStopPx, limit=reverseTpPx)
+    else
+        strategy.exit("Exit RevShort", "RevShort", stop=reverseStopPx)
+    if isShort and na(reverseTpPx) and close <= smoothMid
+        strategy.close("RevShort", comment="Reverse TP Channel")
+
+// ============================================================
+// Take Profit at Midline
+// ============================================================
+longTP1 = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and not na(entryPx1) and close >= midHigh - tpZoneOffset
+longTP2 = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and not na(entryPx2) and close >= smoothRes - tpZoneOffset
+longTP3 = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and not na(entryPx3) and close >= smoothRes - tpZoneOffset
+shortTP1 = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and not na(entryPx1) and close <= midLow + tpZoneOffset
+shortTP2 = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and not na(entryPx2) and close <= midLow + tpZoneOffset
+shortTP3 = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and not na(entryPx3) and close <= midLow + tpZoneOffset
+
+if longTP1
+    strategy.close("Long1", comment="TP L1")
+    entryPx1     := na
+    be1          := false
+    lastEntryBar := bar_index
+
+if longTP2
+    strategy.close("Long2", comment="TP L2")
+    entryPx2     := na
+    be2          := false
+    lastEntryBar := bar_index
+
+if longTP3
+    strategy.close("Long3", comment="TP L3")
+    entryPx3     := na
+    be3          := false
+    lastEntryBar := bar_index
+
+if shortTP1
+    strategy.close("Short1", comment="TP S1")
+    entryPx1     := na
+    be1          := false
+    lastEntryBar := bar_index
+
+if shortTP2
+    strategy.close("Short2", comment="TP S2")
+    entryPx2     := na
+    be2          := false
+    lastEntryBar := bar_index
+
+if shortTP3
+    strategy.close("Short3", comment="TP S3")
+    entryPx3     := na
+    be3          := false
+    lastEntryBar := bar_index
+
+// ============================================================
+// Time-Based Stop & BE Management
+// ============================================================
+// After timeStopBars: if profitable → move to BE+buffer
+// After 2×timeStopBars: if still losing → cut
+timeCheck(entBar, ep, isBuy, idx) =>
+    barsHeld = bar_index - entBar
+    profitable = isBuy ? close > ep : close < ep
+    shouldCut = barsHeld >= timeStopBars * 2 and not profitable
+    shouldBE  = barsHeld >= timeStopBars and profitable
+    [shouldCut, shouldBE]
+
+// Check each entry level for time stop
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and nLong >= 1 and not na(entryPx1)
+    [cut1, setBE1] = timeCheck(entryBar1, entryPx1, true, 1)
+    if cut1
+        strategy.close("Long1", comment="TimeStop L1")
+    if setBE1 and not be1
+        be1 := true
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and nLong >= 2 and not na(entryPx2)
+    [cut2, setBE2] = timeCheck(entryBar2, entryPx2, true, 2)
+    if cut2
+        strategy.close("Long2", comment="TimeStop L2")
+    if setBE2 and not be2
+        be2 := true
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and nLong >= 3 and not na(entryPx3)
+    [cut3, setBE3] = timeCheck(entryBar3, entryPx3, true, 3)
+    if cut3
+        strategy.close("Long3", comment="TimeStop L3")
+    if setBE3 and not be3
+        be3 := true
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and nShort >= 1 and not na(entryPx1)
+    [cut1s, setBE1s] = timeCheck(entryBar1, entryPx1, false, 1)
+    if cut1s
+        strategy.close("Short1", comment="TimeStop S1")
+    if setBE1s and not be1
+        be1 := true
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and nShort >= 2 and not na(entryPx2)
+    [cut2s, setBE2s] = timeCheck(entryBar2, entryPx2, false, 2)
+    if cut2s
+        strategy.close("Short2", comment="TimeStop S2")
+    if setBE2s and not be2
+        be2 := true
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and nShort >= 3 and not na(entryPx3)
+    [cut3s, setBE3s] = timeCheck(entryBar3, entryPx3, false, 3)
+    if cut3s
+        strategy.close("Short3", comment="TimeStop S3")
+    if setBE3s and not be3
+        be3 := true
+
+// ============================================================
+// Stop Loss / BE Exits
+// ============================================================
+// Each entry has its own stop: fixed stop or BE+buffer
+getStop(ep, isBuy, isBE) =>
+    if isBE
+        isBuy ? ep * (1.0 + beBuffer) : ep * (1.0 - beBuffer)
+    else
+        isBuy ? ep - stopMult * curOfs : ep + stopMult * curOfs
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong
+    if nLong >= 1 and not na(entryPx1)
+        strategy.exit("Exit L1", "Long1", stop=getStop(entryPx1, true, be1))
+    if nLong >= 2 and not na(entryPx2)
+        strategy.exit("Exit L2", "Long2", stop=getStop(entryPx2, true, be2))
+    if nLong >= 3 and not na(entryPx3)
+        strategy.exit("Exit L3", "Long3", stop=getStop(entryPx3, true, be3))
+
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort
+    if nShort >= 1 and not na(entryPx1)
+        strategy.exit("Exit S1", "Short1", stop=getStop(entryPx1, false, be1))
+    if nShort >= 2 and not na(entryPx2)
+        strategy.exit("Exit S2", "Short2", stop=getStop(entryPx2, false, be2))
+    if nShort >= 3 and not na(entryPx3)
+        strategy.exit("Exit S3", "Short3", stop=getStop(entryPx3, false, be3))
+
+outsideLongStop = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isLong and outsideLongBars >= outsideStopBars
+outsideShortStop = trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and isShort and outsideShortBars >= outsideStopBars
+
+if outsideLongStop
+    strategy.close("Long1", comment="OutsideStop L1")
+    strategy.close("Long2", comment="OutsideStop L2")
+    strategy.close("Long3", comment="OutsideStop L3")
+    outsideLongBars := 0
+    outsideShortBars := 0
+    lastEntryBar := bar_index
+    didFastExit := true
+
+if outsideShortStop
+    strategy.close("Short1", comment="OutsideStop S1")
+    strategy.close("Short2", comment="OutsideStop S2")
+    strategy.close("Short3", comment="OutsideStop S3")
+    outsideLongBars := 0
+    outsideShortBars := 0
+    lastEntryBar := bar_index
+    didFastExit := true
+
+// Reset when flat
+if isFlat and not didBreakoutFlip
+    if trendMode == 2 or trendMode == -2
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+    nLong    := 0
+    nShort   := 0
+    be1      := false
+    be2      := false
+    be3      := false
+    entryPx1 := na
+    entryPx2 := na
+    entryPx3 := na
+    breakoutInsideBars := 0
+    breakoutEntryBar := na
+    reverseStopPx := na
+    reverseTpPx := na
+    outsideLongBars := 0
+    outsideShortBars := 0
+    trendMode := 0
+
+// ============================================================
+// Entry Orders - 3 Level Pyramiding
+// ============================================================
+// Long entry bands: midLow(L1), support(L2), downerLine(L3)
+// Short entry bands: midHigh(S1), resistance(S2), uperLine(S3)
+nearMidLow  = close <= midLow + zoneOffset
+nearSup     = close <= smoothSup + zoneOffset
+nearDowner  = close <= downerLine + zoneOffset
+nearMidHigh = close >= midHigh - zoneOffset
+nearRes     = close >= smoothRes - zoneOffset
+nearUper    = close >= uperLine - zoneOffset
+
+allocPct1 = 20.0
+allocPct2 = 40.0
+allocPct3 = 40.0
+
+// --- LONG Level 1: midLow + bullish candle + RSI < rsiLong ---
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and not didFastExit and isFlat and not isShort and cooldownOK and longMAFilterOK and nearMidLow and bullishCandle and rsiVal < rsiLong
+    strategy.entry("Long1", strategy.long, qty=strategy.equity * allocPct1 / 100.0 / close)
+    nLong        := 1
+    entryPx1     := close
+    entryBar1    := bar_index
+    be1          := false
+    lastEntryBar := bar_index
+
+// --- LONG Level 2: support + RSI < rsiLong+10 ---
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and not didFastExit and isLong and nLong == 1 and cooldownOK and nearSup and rsiVal < rsiLong + 10
+    strategy.entry("Long2", strategy.long, qty=strategy.equity * allocPct2 / 100.0 / close)
+    nLong        := 2
+    entryPx2     := close
+    entryBar2    := bar_index
+    be2          := false
+    lastEntryBar := bar_index
+
+// --- LONG Level 3: downerLine + RSI < rsiLong+10 ---
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and not didFastExit and isLong and nLong == 2 and cooldownOK and nearDowner and rsiVal < rsiLong + 10
+    strategy.entry("Long3", strategy.long, qty=strategy.equity * allocPct3 / 100.0 / close)
+    nLong        := 3
+    entryPx3     := close
+    entryBar3    := bar_index
+    be3          := false
+    lastEntryBar := bar_index
+
+// --- SHORT Level 1: midHigh + bearish candle + RSI > rsiShort + MA200 downtrend ---
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and not didFastExit and isFlat and not isLong and cooldownOK and enableShort and shortMAFilterOK and nearMidHigh and bearishCandle and rsiVal > rsiShort
+    strategy.entry("Short1", strategy.short, qty=strategy.equity * allocPct1 / 100.0 / close)
+    nShort       := 1
+    entryPx1     := close
+    entryBar1    := bar_index
+    be1          := false
+    lastEntryBar := bar_index
+
+// --- SHORT Level 2: resistance + RSI > rsiShort-10 ---
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and not didFastExit and isShort and nShort == 1 and cooldownOK and nearRes and rsiVal > rsiShort - 10
+    strategy.entry("Short2", strategy.short, qty=strategy.equity * allocPct2 / 100.0 / close)
+    nShort       := 2
+    entryPx2     := close
+    entryBar2    := bar_index
+    be2          := false
+    lastEntryBar := bar_index
+
+// --- SHORT Level 3: uperLine + RSI > rsiShort-10 ---
+if trendMode == 0 and not didBreakoutFlip and not didBreakoutExit and not didFastExit and isShort and nShort == 2 and cooldownOK and nearUper and rsiVal > rsiShort - 10
+    strategy.entry("Short3", strategy.short, qty=strategy.equity * allocPct3 / 100.0 / close)
+    nShort       := 3
+    entryPx3     := close
+    entryBar3    := bar_index
+    be3          := false
+    lastEntryBar := bar_index
+
+// ============================================================
+// Effective stop for plotting (use L1/S1 stop as reference)
+// ============================================================
+effStopPlot = isLong  ? getStop(nz(entryPx1, strategy.position_avg_price), true,  be1) :
+              isShort ? getStop(nz(entryPx1, strategy.position_avg_price), false, be1) : na
+
+// ============================================================
+// Plots
+// ============================================================
+pRes = plot(showBands ? smoothRes : na,  "Resistance",  color=color.new(#FF6347, 0), linewidth=3)
+pSup = plot(showBands ? smoothSup : na,  "Support",     color=color.new(#0084ff, 0), linewidth=3)
+plot(showBands ? smoothMid : na,          "Midline",     color=color.new(color.gray, 30), linewidth=2)
+plot(showBands ? midHigh : na,            "Mid-High",    color=color.new(#daff0b, 50), linewidth=1)
+plot(showBands ? midLow : na,             "Mid-Low",     color=color.new(#0ee9d7, 50), linewidth=1)
+
+pUU  = plot(showBands ? uperLine : na,   "Upper Ch Edge", color=color.new(#e9940c, 70), linewidth=1)
+pDL  = plot(showBands ? downerLine : na, "Lower Ch Edge", color=color.new(#099cf1, 70), linewidth=1)
+fill(pRes, pUU, color=showBands ? color.new(#e9940c, 88) : na)
+fill(pSup, pDL, color=showBands ? color.new(#099cf1, 88) : na)
+fill(pSup, pRes, color=showBands ? color.new(color.gray, 95) : na)
+
+plot(showTrendMA ? maLine : na, "Trend MA", color=color.new(color.yellow, 40), linewidth=2)
+plot(na, "Stop Level", color=color.new(color.fuchsia, 20), style=plot.style_steplinebr, linewidth=2)

@@ -1,0 +1,2 @@
+group,trade_count,avg_hold_hours,median_hold_hours,avg_underwater_hours,median_underwater_hours,avg_underwater_ratio,avg_max_consecutive_underwater_hours,avg_max_adverse_pct,median_max_adverse_pct,avg_max_favorable_pct,median_pnl_abs,avg_pnl_abs
+losing_trades,300,13.996666666666666,13.5,10.425,7.25,0.7192575055902847,8.678333333333335,2.2335613395842295,1.945801570364193,0.8097154619702899,-19.76981677746324,-40.41629034832429

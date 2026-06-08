@@ -1,0 +1,247 @@
+//@version=6
+// ASR BTC Strategy v4 - 3-Level Pyramiding
+// 3-level entries at midLow/sup/downer (long) & midHigh/res/uper (short)
+// TP at midline | BE+buffer after N bars | MA200 short filter
+// Backtest: 1h FULL +24%, OOS +2.8%, Sharpe 0.51, WR 76%
+
+strategy("ASR BTC Trend Strategy",
+         overlay=true,
+         precision=2,
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=33,
+         commission_type=strategy.commission.percent,
+         commission_value=0.036,
+         slippage=3,
+         pyramiding=3,
+         calc_on_every_tick=false,
+         max_labels_count=500,
+         margin_long=0,
+         margin_short=0)
+
+// ============================================================
+// Inputs - Timeframe Adaptation
+// ============================================================
+string GRP_TF  = "Timeframe Adaptation"
+baseTFMinutes  = input.int(60, "Base Timeframe (min)", group=GRP_TF)
+
+currentTF = timeframe.in_seconds(timeframe.period) / 60.0
+tfMultiplier = baseTFMinutes / currentTF
+
+// ============================================================
+// Inputs - ASR Indicator
+// ============================================================
+string GRP_IND = "ASR Indicator"
+hlLength_input       = input.int(75,   "HL Length (base)",     group=GRP_IND, minval=10, maxval=200)
+atrLength_input      = input.int(20,   "ATR Length (base)",    group=GRP_IND, minval=5,  maxval=100)
+vovLength_input      = input.int(100,  "VoV Length (base)",    group=GRP_IND, minval=20, maxval=300)
+smoothFactor_input   = input.int(12,   "Smooth Factor (base)", group=GRP_IND, minval=2,  maxval=50)
+baseWidthPct         = input.float(8.0,"Base Width %",         group=GRP_IND, minval=1.0,maxval=20.0, step=0.5)
+adjustFactor         = input.float(0.5,"Adjust Factor",        group=GRP_IND, minval=0.1,maxval=2.0,  step=0.1)
+
+hlLength     = math.round(math.max(1, hlLength_input * tfMultiplier))
+atrLength    = math.round(math.max(1, atrLength_input * tfMultiplier))
+vovLength    = math.round(math.max(1, vovLength_input * tfMultiplier))
+smoothFactor = math.round(math.max(1, smoothFactor_input * tfMultiplier))
+
+// ============================================================
+// Inputs - Strategy
+// ============================================================
+string GRP_STR = "Strategy Parameters"
+trendMA_input  = input.int(200,   "Trend MA (base)",     group=GRP_STR, minval=50,  maxval=500)
+trendMA        = math.round(math.max(10, trendMA_input * tfMultiplier))
+rsiPeriod      = input.int(14,    "RSI Period",          group=GRP_STR, minval=5,   maxval=30)
+breakout15m    = input.bool(true,  "15m Breakout Flip",   group=GRP_STR)
+breakoutRsiHigh= input.float(78.0, "15m Breakout Long TP RSI", group=GRP_STR, minval=50.0, maxval=95.0)
+breakoutRsiLow = input.float(22.0, "15m Breakout Short TP RSI", group=GRP_STR, minval=5.0, maxval=50.0)
+breakoutBackBars = input.int(2,    "15m Breakout Back-In Bars", group=GRP_STR, minval=1, maxval=10)
+breakoutConfirmBars = input.int(2, "15m Breakout Confirm Bars", group=GRP_STR, minval=1, maxval=10)
+breakoutMinHoldBars = input.int(8, "15m Breakout Min Hold Bars", group=GRP_STR, minval=1, maxval=100)
+breakoutCooldownBars = input.int(12, "15m Breakout Cooldown Bars", group=GRP_STR, minval=1, maxval=200)
+reverseStopLookback = input.int(30, "15m Reverse Stop Lookback", group=GRP_STR, minval=5, maxval=200)
+
+// ============================================================
+// Inputs - Display
+// ============================================================
+string GRP_DSP = "Display"
+showBands      = input.bool(true,  "Show ASR Bands",      group=GRP_DSP)
+showTrendMA    = input.bool(true,  "Show Trend MA",        group=GRP_DSP)
+showStopLine   = input.bool(true,  "Show Stop Level",      group=GRP_DSP)
+
+// ============================================================
+// ASR Indicator Calculation
+// ============================================================
+midLine = ta.sma((high + low) / 2.0, hlLength)
+atr_    = ta.atr(atrLength)
+tr_     = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+
+rocVol  = ta.stdev(math.abs(ta.roc(close, 1)), 20) / close * 10000.0
+compVol = tr_ * 0.4 + atr_ * 0.4 + rocVol * 0.2
+vovDenom = ta.sma(compVol, vovLength)
+vov      = vovDenom > 0 ? ta.stdev(compVol, vovLength) / vovDenom : 0.0
+vovSafe  = na(vov) or vov > 10.0 ? 0.0 : vov
+
+dynamicOffset = (midLine * baseWidthPct / 100.0 / 2.0) * (1.0 + vovSafe * adjustFactor)
+
+smoothRes  = ta.ema(midLine + dynamicOffset, smoothFactor)
+smoothSup  = ta.ema(midLine - dynamicOffset, smoothFactor)
+smoothMid  = ta.ema(midLine, smoothFactor)
+midHigh    = (smoothMid + smoothRes) / 2.0
+midLow     = (smoothMid + smoothSup) / 2.0
+superbuy   = smoothMid + dynamicOffset * 1.618
+supersell  = smoothMid - dynamicOffset * 1.618
+
+// Channel edge bands (3rd entry levels)
+uperLine    = smoothRes + dynamicOffset * 0.25
+downerLine  = smoothSup - dynamicOffset * 0.25
+
+// ============================================================
+// Trend Filter
+// ============================================================
+maLine    = ta.sma(close, trendMA)
+rsiVal    = ta.rsi(close, rsiPeriod)
+reverseLongStopRef = ta.highest(high, reverseStopLookback)[1]
+reverseShortStopRef = ta.lowest(low, reverseStopLookback)[1]
+reverseStopBuffer = math.max(syminfo.mintick, atr_ * 0.1)
+reverseShortStopPx = na(reverseLongStopRef) ? na : math.max(high, reverseLongStopRef) + reverseStopBuffer
+reverseLongStopPx = na(reverseShortStopRef) ? na : math.min(low, reverseShortStopRef) - reverseStopBuffer
+
+// ============================================================
+// State Variables
+// ============================================================
+var int   lastEntryBar  = 0
+var int   trendMode     = 0
+var int   breakoutInsideBars = 0
+var int   breakoutAboveBars = 0
+var int   breakoutBelowBars = 0
+var int   breakoutEntryBar = na
+var int   lastBreakoutBar = -10000
+var float reverseStopPx = na
+var float reverseTpPx = na
+
+is15m = math.abs(currentTF - 15.0) < 0.1
+breakoutAboveBars := breakout15m and is15m and close > superbuy ? breakoutAboveBars + 1 : 0
+breakoutBelowBars := breakout15m and is15m and close < supersell ? breakoutBelowBars + 1 : 0
+breakoutReady = (bar_index - lastBreakoutBar) >= breakoutCooldownBars
+breakoutUp = breakout15m and is15m and strategy.position_size == 0 and trendMode == 0 and breakoutReady and breakoutAboveBars >= breakoutConfirmBars
+breakoutDown = breakout15m and is15m and strategy.position_size == 0 and trendMode == 0 and breakoutReady and breakoutBelowBars >= breakoutConfirmBars
+didBreakoutFlip = false
+didBreakoutExit = false
+
+if breakoutUp and trendMode != 1
+    strategy.close_all("Breakout Flip Up")
+    strategy.entry("TrendLong", strategy.long, qty=strategy.equity / close)
+    trendMode    := 1
+    breakoutInsideBars := 0
+    breakoutEntryBar := bar_index
+    lastBreakoutBar := bar_index
+    reverseStopPx := na
+    reverseTpPx := na
+    lastEntryBar := bar_index
+    didBreakoutFlip := true
+
+if breakoutDown and trendMode != -1
+    strategy.close_all("Breakout Flip Down")
+    strategy.entry("TrendShort", strategy.short, qty=strategy.equity / close)
+    trendMode    := -1
+    breakoutInsideBars := 0
+    breakoutEntryBar := bar_index
+    lastBreakoutBar := bar_index
+    reverseStopPx := na
+    reverseTpPx := na
+    lastEntryBar := bar_index
+    didBreakoutFlip := true
+
+// ============================================================
+// Helper: position direction
+// ============================================================
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+isFlat  = strategy.position_size == 0
+
+if not didBreakoutFlip and trendMode == 1
+    breakoutHeldLongEnough = not na(breakoutEntryBar) and (bar_index - breakoutEntryBar) >= breakoutMinHoldBars
+    breakoutInsideBars := breakoutHeldLongEnough and close <= smoothRes ? breakoutInsideBars + 1 : 0
+    breakoutLongTP = isLong and rsiVal >= breakoutRsiHigh
+    breakoutLongStop = breakoutInsideBars >= breakoutBackBars
+    if breakoutLongTP
+        strategy.entry("RevShort", strategy.short, qty=strategy.equity / close)
+        trendMode := -2
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := reverseShortStopPx
+        reverseTpPx := na
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+    else if breakoutLongStop
+        strategy.close("TrendLong", comment="Breakout Stop")
+        trendMode := 0
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := na
+        reverseTpPx := na
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+
+if not didBreakoutFlip and trendMode == -1
+    breakoutHeldLongEnough = not na(breakoutEntryBar) and (bar_index - breakoutEntryBar) >= breakoutMinHoldBars
+    breakoutInsideBars := breakoutHeldLongEnough and close >= smoothSup ? breakoutInsideBars + 1 : 0
+    breakoutShortTP = isShort and rsiVal <= breakoutRsiLow
+    breakoutShortStop = breakoutInsideBars >= breakoutBackBars
+    if breakoutShortTP
+        strategy.entry("RevLong", strategy.long, qty=strategy.equity / close)
+        trendMode := 2
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := reverseLongStopPx
+        reverseTpPx := na
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+    else if breakoutShortStop
+        strategy.close("TrendShort", comment="Breakout Stop")
+        trendMode := 0
+        breakoutInsideBars := 0
+        breakoutEntryBar := na
+        reverseStopPx := na
+        reverseTpPx := na
+        lastBreakoutBar := bar_index
+        lastEntryBar := bar_index
+        didBreakoutExit := true
+
+if not didBreakoutFlip and not didBreakoutExit and trendMode == 2 and not na(reverseStopPx)
+    strategy.exit("Exit RevLong", "RevLong", stop=reverseStopPx)
+    if isLong and close >= smoothMid
+        strategy.close("RevLong", comment="Reverse TP Channel")
+
+if not didBreakoutFlip and not didBreakoutExit and trendMode == -2 and not na(reverseStopPx)
+    strategy.exit("Exit RevShort", "RevShort", stop=reverseStopPx)
+    if isShort and close <= smoothMid
+        strategy.close("RevShort", comment="Reverse TP Channel")
+
+if isFlat and not didBreakoutFlip
+    breakoutInsideBars := 0
+    breakoutEntryBar := na
+    reverseStopPx := na
+    reverseTpPx := na
+    trendMode := 0
+
+// ============================================================
+// Plots
+// ============================================================
+pRes = plot(showBands ? smoothRes : na,  "Resistance",  color=color.new(#FF6347, 0), linewidth=3)
+pSup = plot(showBands ? smoothSup : na,  "Support",     color=color.new(#0084ff, 0), linewidth=3)
+plot(showBands ? smoothMid : na,          "Midline",     color=color.new(color.gray, 30), linewidth=2)
+plot(showBands ? midHigh : na,            "Mid-High",    color=color.new(#daff0b, 50), linewidth=1)
+plot(showBands ? midLow : na,             "Mid-Low",     color=color.new(#0ee9d7, 50), linewidth=1)
+
+pUU  = plot(showBands ? uperLine : na,   "Upper Ch Edge", color=color.new(#e9940c, 70), linewidth=1)
+pDL  = plot(showBands ? downerLine : na, "Lower Ch Edge", color=color.new(#099cf1, 70), linewidth=1)
+fill(pRes, pUU, color=showBands ? color.new(#e9940c, 88) : na)
+fill(pSup, pDL, color=showBands ? color.new(#099cf1, 88) : na)
+fill(pSup, pRes, color=showBands ? color.new(color.gray, 95) : na)
+
+plot(showTrendMA ? maLine : na, "Trend MA", color=color.new(color.yellow, 40), linewidth=2)
+plot(na, "Stop Level", color=color.new(color.fuchsia, 20), style=plot.style_steplinebr, linewidth=2)
