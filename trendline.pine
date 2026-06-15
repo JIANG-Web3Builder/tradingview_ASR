@@ -1,0 +1,421 @@
+//@version=6
+indicator(
+     title = "Adaptive HH HL / LL LH Structure Trend - Protected Structure",
+     shorttitle = "Protected Structure Trend",
+     overlay = true
+)
+
+// ======================================================
+// 参数
+// ======================================================
+maLen = input.int(60, "均线长度", minval = 1)
+
+trendTF = input.timeframe("240", "大级别趋势结构周期，15m图推荐 240=4H")
+midTrendTF = input.timeframe("60", "中级趋势结构周期，15m图可用 60=1H")
+
+atrLen = input.int(14, "ATR长度", minval = 1)
+
+// 极值确认阈值：价格从候选高/低点反向移动多少，才确认一个 swing high / swing low
+revAtrMult = input.float(1.60, "极值确认：ATR倍数", minval = 0.1, step = 0.1)
+revPct     = input.float(0.40, "极值确认：最小百分比%", minval = 0.0, step = 0.05)
+
+// 极值区域容差：新极值点必须明显高于/低于上一个极值点，才算 HH/HL/LH/LL
+zoneAtrMult = input.float(0.35, "极值区域：ATR容差倍数", minval = 0.0, step = 0.05)
+zonePct     = input.float(0.10, "极值区域：百分比容差%", minval = 0.0, step = 0.01)
+
+// 原来的震荡判断
+rangePivotCount = input.int(2, "连续几个无效极值后转震荡", minval = 1, maxval = 5)
+
+// 新增：反转保护
+protectPivotCount = input.int(2, "反转保护：参考最近N个同类极值", minval = 1, maxval = 3)
+
+// 新增：反向破位确认次数
+switchConfirmCount = input.int(1, "反向破位确认次数", minval = 1, maxval = 3)
+
+// 新增：内部小极值是否保持原趋势
+keepTrendWhenInside = input.bool(true, "内部小极值保持原趋势")
+
+showBg       = input.bool(true, "显示背景颜色")
+
+// ======================================================
+// 自适应结构趋势函数
+// 返回：
+//  1 = 上涨结构
+// -1 = 下跌结构
+//  0 = 震荡 / 不明确
+// ======================================================
+f_adaptiveStructureTrend(
+     int _atrLen,
+     float _revAtrMult,
+     float _revPct,
+     float _zoneAtrMult,
+     float _zonePct,
+     int _rangePivotCount,
+     int _protectPivotCount,
+     int _switchConfirmCount,
+     bool _keepTrendWhenInside
+) =>
+    atr = ta.atr(_atrLen)
+
+    // 极值确认阈值：ATR 和百分比二者取较大值
+    reversalSize = math.max(atr * _revAtrMult, close * _revPct * 0.01)
+
+    // 极值区域容差：避免一点点创新高/新低就改变趋势
+    zoneSize = math.max(atr * _zoneAtrMult, close * _zonePct * 0.01)
+
+    // leg:
+    //  0 = 初始状态
+    //  1 = 当前处于上升波段，正在寻找 swing high
+    // -1 = 当前处于下跌波段，正在寻找 swing low
+    var int leg = 0
+
+    // 趋势状态
+    var int trend = 0
+
+    // 候选极值
+    var float candidateHigh = na
+    var float candidateLow  = na
+
+    // 最近确认的同类极值
+    var float lastSwingHigh = na
+    var float lastSwingLow  = na
+
+    // 更早的同类极值，用于判断“大结构保护位”
+    var float prevSwingHigh1 = na
+    var float prevSwingHigh2 = na
+    var float prevSwingLow1  = na
+    var float prevSwingLow2  = na
+
+    // 内部无效极值计数
+    var int neutralPivotCounter = 0
+
+    // 反向破位确认计数
+    var int bullBreakCounter = 0
+    var int bearBreakCounter = 0
+
+    // 初始化
+    if na(candidateHigh)
+        candidateHigh := high
+
+    if na(candidateLow)
+        candidateLow := low
+
+    // ==================================================
+    // 初始状态：先确认第一段方向
+    // ==================================================
+    if leg == 0
+        candidateHigh := math.max(candidateHigh, high)
+        candidateLow  := math.min(candidateLow, low)
+
+        upMoveFromLow    = high - candidateLow
+        downMoveFromHigh = candidateHigh - low
+
+        // 从候选低点向上反转足够多，确认一个 swing low
+        if upMoveFromLow >= reversalSize and upMoveFromLow >= downMoveFromHigh
+            if not na(lastSwingLow)
+                isHL = candidateLow > lastSwingLow + zoneSize
+                isLL = candidateLow < lastSwingLow - zoneSize
+
+                if isHL
+                    trend := 1
+                    neutralPivotCounter := 0
+                    bearBreakCounter := 0
+                else if isLL
+                    trend := -1
+                    neutralPivotCounter := 0
+                    bullBreakCounter := 0
+                else
+                    neutralPivotCounter += 1
+
+            if not na(lastSwingLow)
+                prevSwingLow2 := prevSwingLow1
+                prevSwingLow1 := lastSwingLow
+
+            lastSwingLow := candidateLow
+            leg := 1
+            candidateHigh := high
+
+        // 从候选高点向下反转足够多，确认一个 swing high
+        else if downMoveFromHigh >= reversalSize
+            if not na(lastSwingHigh)
+                isHH = candidateHigh > lastSwingHigh + zoneSize
+                isLH = candidateHigh < lastSwingHigh - zoneSize
+
+                if isHH
+                    trend := 1
+                    neutralPivotCounter := 0
+                    bearBreakCounter := 0
+                else if isLH
+                    trend := -1
+                    neutralPivotCounter := 0
+                    bullBreakCounter := 0
+                else
+                    neutralPivotCounter += 1
+
+            if not na(lastSwingHigh)
+                prevSwingHigh2 := prevSwingHigh1
+                prevSwingHigh1 := lastSwingHigh
+
+            lastSwingHigh := candidateHigh
+            leg := -1
+            candidateLow := low
+
+    // ==================================================
+    // 上升波段：确认 swing high
+    // ==================================================
+    else if leg == 1
+        candidateHigh := math.max(candidateHigh, high)
+
+        if candidateHigh - low >= reversalSize
+            if not na(lastSwingHigh)
+                // 保护高点：最近 N 个高点中的最高点
+                protectedHigh = lastSwingHigh
+
+                if _protectPivotCount >= 2 and not na(prevSwingHigh1)
+                    protectedHigh := math.max(protectedHigh, prevSwingHigh1)
+
+                if _protectPivotCount >= 3 and not na(prevSwingHigh2)
+                    protectedHigh := math.max(protectedHigh, prevSwingHigh2)
+
+                isHH = candidateHigh > lastSwingHigh + zoneSize
+                isLH = candidateHigh < lastSwingHigh - zoneSize
+
+                // 是否真正突破下跌结构的保护高点
+                breaksProtectedHigh = candidateHigh > protectedHigh + zoneSize
+
+                // ------------------------------
+                // 当前是下跌趋势
+                // 只有突破保护高点，才允许转多
+                // ------------------------------
+                if trend == -1
+                    if breaksProtectedHigh
+                        bullBreakCounter += 1
+                        bearBreakCounter := 0
+
+                        if bullBreakCounter >= _switchConfirmCount
+                            trend := 1
+                            bullBreakCounter := 0
+                            neutralPivotCounter := 0
+
+                    else if isLH
+                        // 下跌趋势中的 LH，只是延续下跌结构
+                        trend := -1
+                        bullBreakCounter := 0
+                        neutralPivotCounter := 0
+
+                    else
+                        // 内部小高点，不改变原趋势
+                        if _keepTrendWhenInside
+                            neutralPivotCounter := 0
+                        else
+                            neutralPivotCounter += 1
+
+                // ------------------------------
+                // 当前是上涨趋势
+                // 小 LH 不允许直接转空
+                // ------------------------------
+                else if trend == 1
+                    if isHH
+                        // 上涨趋势中的 HH，延续上涨结构
+                        trend := 1
+                        bearBreakCounter := 0
+                        neutralPivotCounter := 0
+                    else
+                        // 上涨趋势中的 LH 或内部高点，只能视为回调，不改变趋势
+                        if _keepTrendWhenInside
+                            neutralPivotCounter := 0
+                        else
+                            neutralPivotCounter += 1
+
+                // ------------------------------
+                // 当前趋势不明确
+                // ------------------------------
+                else
+                    if isHH
+                        trend := 1
+                        neutralPivotCounter := 0
+                    else if isLH
+                        trend := -1
+                        neutralPivotCounter := 0
+                    else
+                        neutralPivotCounter += 1
+
+            if not na(lastSwingHigh)
+                prevSwingHigh2 := prevSwingHigh1
+                prevSwingHigh1 := lastSwingHigh
+
+            lastSwingHigh := candidateHigh
+            leg := -1
+            candidateLow := low
+
+    // ==================================================
+    // 下跌波段：确认 swing low
+    // ==================================================
+    else if leg == -1
+        candidateLow := math.min(candidateLow, low)
+
+        if high - candidateLow >= reversalSize
+            if not na(lastSwingLow)
+                // 保护低点：最近 N 个低点中的最低点
+                protectedLow = lastSwingLow
+
+                if _protectPivotCount >= 2 and not na(prevSwingLow1)
+                    protectedLow := math.min(protectedLow, prevSwingLow1)
+
+                if _protectPivotCount >= 3 and not na(prevSwingLow2)
+                    protectedLow := math.min(protectedLow, prevSwingLow2)
+
+                isHL = candidateLow > lastSwingLow + zoneSize
+                isLL = candidateLow < lastSwingLow - zoneSize
+
+                // 是否真正跌破上涨结构的保护低点
+                breaksProtectedLow = candidateLow < protectedLow - zoneSize
+
+                // ------------------------------
+                // 当前是上涨趋势
+                // 只有跌破保护低点，才允许转空
+                // ------------------------------
+                if trend == 1
+                    if breaksProtectedLow
+                        bearBreakCounter += 1
+                        bullBreakCounter := 0
+
+                        if bearBreakCounter >= _switchConfirmCount
+                            trend := -1
+                            bearBreakCounter := 0
+                            neutralPivotCounter := 0
+
+                    else if isHL
+                        // 上涨趋势中的 HL，延续上涨结构
+                        trend := 1
+                        bearBreakCounter := 0
+                        neutralPivotCounter := 0
+
+                    else
+                        // 小 LL 但没有跌破大结构保护低点，不改变趋势
+                        if _keepTrendWhenInside
+                            neutralPivotCounter := 0
+                        else
+                            neutralPivotCounter += 1
+
+                // ------------------------------
+                // 当前是下跌趋势
+                // 小 HL 不允许直接转多
+                // ------------------------------
+                else if trend == -1
+                    if isLL
+                        // 下跌趋势中的 LL，延续下跌结构
+                        trend := -1
+                        bullBreakCounter := 0
+                        neutralPivotCounter := 0
+                    else
+                        // 下跌趋势中的 HL 或内部低点，只能视为反弹，不改变趋势
+                        if _keepTrendWhenInside
+                            neutralPivotCounter := 0
+                        else
+                            neutralPivotCounter += 1
+
+                // ------------------------------
+                // 当前趋势不明确
+                // ------------------------------
+                else
+                    if isHL
+                        trend := 1
+                        neutralPivotCounter := 0
+                    else if isLL
+                        trend := -1
+                        neutralPivotCounter := 0
+                    else
+                        neutralPivotCounter += 1
+
+            if not na(lastSwingLow)
+                prevSwingLow2 := prevSwingLow1
+                prevSwingLow1 := lastSwingLow
+
+            lastSwingLow := candidateLow
+            leg := 1
+            candidateHigh := high
+
+    // ==================================================
+    // 震荡处理
+    // ==================================================
+    if not _keepTrendWhenInside and neutralPivotCounter >= _rangePivotCount
+        trend := 0
+        bullBreakCounter := 0
+        bearBreakCounter := 0
+
+    trend
+
+// ======================================================
+// 获取高周期结构趋势
+// 仍然只使用上一根已经确认的高周期K线结果，避免未来函数
+// ======================================================
+structureTrend = request.security(
+     syminfo.tickerid,
+     trendTF,
+     f_adaptiveStructureTrend(
+         atrLen,
+         revAtrMult,
+         revPct,
+         zoneAtrMult,
+         zonePct,
+         rangePivotCount,
+         protectPivotCount,
+         switchConfirmCount,
+         keepTrendWhenInside
+     )[1],
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on
+)
+
+midStructureTrend = request.security(
+     syminfo.tickerid,
+     midTrendTF,
+     f_adaptiveStructureTrend(
+         atrLen,
+         revAtrMult,
+         revPct,
+         zoneAtrMult,
+         zonePct,
+         rangePivotCount,
+         protectPivotCount,
+         switchConfirmCount,
+         keepTrendWhenInside
+     )[1],
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on
+)
+
+// ======================================================
+// 均线染色
+// ======================================================
+ma = ta.sma(close, maLen)
+
+maColor =
+     structureTrend == 1  ? color.green :
+     structureTrend == -1 ? color.red :
+     color.blue
+
+plot(ma, title = "结构趋势均线", color = maColor, linewidth = 3)
+
+// ======================================================
+// 中级预警 + 大级确认趋势线
+// 中级别先反向时只变蓝；只有大级别也反向后才变成红色/绿色。
+// ======================================================
+isMidWarning = structureTrend != 0 and midStructureTrend != 0 and midStructureTrend != structureTrend
+confirmedDisplayTrend = isMidWarning ? 0 : structureTrend
+
+confirmedMaColor =
+     confirmedDisplayTrend == 1  ? color.green :
+     confirmedDisplayTrend == -1 ? color.red :
+     color.blue
+
+plot(ma, title = "中级预警大级确认趋势线", color = confirmedMaColor, linewidth = 4)
+
+// 背景颜色
+bgcolor(
+     showBg and confirmedDisplayTrend == 1  ? color.new(color.green, 90) :
+     showBg and confirmedDisplayTrend == -1 ? color.new(color.red, 90) :
+     showBg ? color.new(color.blue, 93) :
+     na
+)
